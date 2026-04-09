@@ -7,3 +7,4 @@ soundfile
 gtts
 numpy
 pydub
+pypdf

@@ -2,12 +2,14 @@
 
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 
 from src.core.audio_recorder import AudioRecorder
+from src.core.document_reader import DocumentReader
 from src.core.summarize import SummaryEngine
 from src.core.transcribe import TranscriptionEngine
 from src.core.tts_engine import TTSEngine
@@ -25,6 +27,72 @@ st.set_page_config(
 )
 
 
+TTS_LANGUAGE_OPTIONS = {
+    "English": "en",
+    "Hindi": "hi",
+    "Marathi": "mr",
+    "Tamil": "ta",
+    "Urdu": "ur",
+}
+
+VOICE_TONE_OPTIONS = {
+    "Professional": "professional",
+    "Friendly": "friendly",
+    "Warm": "warm",
+}
+
+VOICE_ACCENT_OPTIONS = {
+    "Global": "com",
+    "India": "co.in",
+    "UK": "co.uk",
+    "Australia": "com.au",
+}
+
+
+def cleanup_generated_audio():
+    audio_file = st.session_state.get("generated_audio_file")
+    if audio_file and os.path.exists(audio_file):
+        TTSEngine().cleanup(audio_file)
+    st.session_state.generated_audio_file = None
+    st.session_state.generated_audio_bytes = None
+    st.session_state.generated_audio_name = None
+    st.session_state.spoken_summary_text = ""
+
+
+def build_spoken_summary(summary_data, tone):
+    summary_text = summary_data.get("summary", "").strip()
+
+    intro_map = {
+        "professional": "Here is your voice note summary.",
+        "friendly": "Here is a quick, easy summary of your voice note.",
+        "warm": "Here is a warm and clear recap of your voice note.",
+    }
+    closing_map = {
+        "professional": "That is the complete summary.",
+        "friendly": "That is the full update in a simple way.",
+        "warm": "That is your recap, shared in a more human way.",
+    }
+
+    if summary_text:
+        return " ".join(
+            [
+                intro_map.get(tone, intro_map["professional"]),
+                summary_text,
+                closing_map.get(tone, closing_map["professional"]),
+            ]
+        )[:500]
+
+    return intro_map.get(tone, intro_map["professional"])
+
+
+def normalize_transcription_for_selected_language(transcription_text, target_language):
+    normalized_result = st.session_state.summarizer.normalize_transcript(
+        transcription_text,
+        target_language=target_language,
+    )
+    return normalized_result.get("text", transcription_text)
+
+
 if "transcription" not in st.session_state:
     st.session_state.transcription = ""
 if "summary" not in st.session_state:
@@ -39,6 +107,64 @@ if "recording_complete" not in st.session_state:
     st.session_state.recording_complete = False
 if "recorded_file" not in st.session_state:
     st.session_state.recorded_file = None
+if "generated_audio_file" not in st.session_state:
+    st.session_state.generated_audio_file = None
+if "generated_audio_bytes" not in st.session_state:
+    st.session_state.generated_audio_bytes = None
+if "generated_audio_name" not in st.session_state:
+    st.session_state.generated_audio_name = None
+if "spoken_summary_text" not in st.session_state:
+    st.session_state.spoken_summary_text = ""
+if "last_recording_message" not in st.session_state:
+    st.session_state.last_recording_message = ""
+if "recording_session" not in st.session_state:
+    st.session_state.recording_session = None
+
+
+def finalize_recording_session(tts_lang, model_size):
+    session = st.session_state.recording_session
+    if session is None or not session.is_finished():
+        return
+
+    if session.canceled:
+        st.session_state.last_recording_message = "Recording cancelled"
+        st.session_state.recording_session = None
+        st.session_state.recording_complete = False
+        return
+
+    if session.error:
+        st.session_state.last_recording_message = ""
+        st.session_state.recording_session = None
+        st.error(f"Recording failed: {session.error}")
+        return
+
+    try:
+        if (
+            st.session_state.transcriber is None
+            or st.session_state.transcriber.model_size != model_size
+        ):
+            st.session_state.transcriber = TranscriptionEngine(model_size)
+            st.session_state.transcriber.load_model()
+
+        recorder = AudioRecorder()
+        filename = f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+        saved_path = recorder.save_to_file(session.audio, filename)
+        st.session_state.recorded_file = saved_path
+        st.session_state.recording_complete = True
+        st.session_state.last_recording_message = (
+            f"Recording complete and saved as {filename}"
+        )
+
+        result = st.session_state.transcriber.transcribe_file(saved_path)
+        st.session_state.transcription = normalize_transcription_for_selected_language(
+            result["text"],
+            tts_lang,
+        )
+    except Exception as exc:
+        st.session_state.last_recording_message = ""
+        st.error(f"Recording failed: {exc}")
+    finally:
+        st.session_state.recording_session = None
 
 
 st.title("AI Voice Note Pro")
@@ -49,9 +175,9 @@ with st.sidebar:
     st.header("Settings")
 
     if st.session_state.summarizer.use_ai:
-        st.success("AI Mode: OpenAI connected")
+        pass
     else:
-        st.warning("Local Mode: Add OPENAI_API_KEY to .env for AI summaries")
+        st.warning("Local Mode: Add OPENAI_API_KEY or GROQ_API_KEY to .env for AI summaries")
 
     model_size = st.selectbox(
         "Model Size",
@@ -65,11 +191,33 @@ with st.sidebar:
             st.session_state.transcriber.load_model()
             st.success("Model loaded")
 
-    tts_lang = st.selectbox(
+    tts_language_name = st.selectbox(
         "TTS Language",
-        ["en", "es", "fr", "de", "hi", "ja"],
+        list(TTS_LANGUAGE_OPTIONS.keys()),
         index=0,
     )
+    tts_lang = TTS_LANGUAGE_OPTIONS[tts_language_name]
+
+    voice_tone_name = st.selectbox(
+        "Voice Style",
+        list(VOICE_TONE_OPTIONS.keys()),
+        index=2,
+    )
+    voice_tone = VOICE_TONE_OPTIONS[voice_tone_name]
+
+    voice_accent_name = st.selectbox(
+        "Voice Accent",
+        list(VOICE_ACCENT_OPTIONS.keys()),
+        index=1,
+    )
+    voice_accent = VOICE_ACCENT_OPTIONS[voice_accent_name]
+
+    voice_speed = st.selectbox(
+        "Voice Speed",
+        ["Natural", "Slow and clear"],
+        index=0,
+    )
+    voice_is_slow = voice_speed == "Slow and clear"
 
 
 tab1, tab2, tab3, tab4 = st.tabs(["Record", "Upload", "Summary", "Export"])
@@ -77,26 +225,23 @@ tab1, tab2, tab3, tab4 = st.tabs(["Record", "Upload", "Summary", "Export"])
 
 with tab1:
     st.subheader("Live Recording")
-
-    duration = st.slider("Recording duration (seconds)", 5, 60, 30)
+    finalize_recording_session(tts_lang, model_size)
     col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("Start Recording", type="primary", use_container_width=True):
+        if st.session_state.recording_session is None and st.button(
+            "Start Recording", type="primary", use_container_width=True
+        ):
             recorder = AudioRecorder()
-            with st.spinner(f"Recording for {duration} seconds... Speak now"):
-                try:
-                    audio, _sr = recorder.record(duration)
-                    filename = f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-                    saved_path = recorder.save_to_file(audio, filename)
-                    st.session_state.recorded_file = saved_path
-                    st.session_state.recording_complete = True
-                    st.success(f"Recording complete. Saved as {filename}")
-                except Exception as exc:
-                    st.error(f"Recording failed: {exc}")
+            st.session_state.last_recording_message = ""
+            st.session_state.recording_complete = False
+            st.session_state.recording_session = recorder.start_recording_session()
+            st.rerun()
 
     with col2:
-        if st.button("Clear Recording", use_container_width=True):
+        if st.session_state.recording_session is None and st.button(
+            "Clear Recording", use_container_width=True
+        ):
             if (
                 st.session_state.recorded_file
                 and os.path.exists(st.session_state.recorded_file)
@@ -105,61 +250,126 @@ with tab1:
             st.session_state.recording_complete = False
             st.session_state.recorded_file = None
             st.session_state.transcription = ""
+            st.session_state.summary = {}
+            st.session_state.last_recording_message = ""
             st.rerun()
+
+    active_session = st.session_state.recording_session
+    if active_session is not None:
+        st.markdown(
+            """
+            <div style="
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 16px;
+                padding: 18px 20px;
+                margin: 18px 0;
+                background: linear-gradient(135deg, rgba(255,82,82,0.16), rgba(255,255,255,0.03));
+            ">
+                <div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">
+                    <div style="
+                        width:14px;
+                        height:14px;
+                        border-radius:999px;
+                        background:#ff5252;
+                        box-shadow:0 0 0 0 rgba(255,82,82,0.7);
+                        animation:pulse-record 1.4s infinite;
+                    "></div>
+                    <div style="font-size:28px; font-weight:700; color:#ffffff;">Recording in progress</div>
+                </div>
+                <div style="font-size:16px; color:#f3f4f6;">
+                    Speak naturally. We will stop when you pause, or you can stop or cancel below.
+                </div>
+            </div>
+            <style>
+                @keyframes pulse-record {
+                    0% { box-shadow: 0 0 0 0 rgba(255,82,82,0.7); }
+                    70% { box-shadow: 0 0 0 12px rgba(255,82,82,0); }
+                    100% { box-shadow: 0 0 0 0 rgba(255,82,82,0); }
+                }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            if st.button("Stop Recording", type="primary", use_container_width=True):
+                active_session.stop()
+                st.rerun()
+        with action_col2:
+            if st.button("Cancel Recording", use_container_width=True):
+                active_session.cancel()
+                st.rerun()
+
+        time.sleep(0.5)
+        st.rerun()
+    else:
+        st.caption("Speak naturally. Recording starts immediately and stops once you pause.")
+
+    if st.session_state.last_recording_message:
+        st.success(st.session_state.last_recording_message)
 
     if st.session_state.recording_complete and st.session_state.recorded_file:
         st.audio(st.session_state.recorded_file)
 
-        if st.button("Transcribe Recording", type="secondary", use_container_width=True):
-            if st.session_state.transcriber:
-                with st.spinner("Transcribing audio... This may take a moment"):
-                    try:
-                        if os.path.exists(st.session_state.recorded_file):
-                            result = st.session_state.transcriber.transcribe_file(
-                                st.session_state.recorded_file
-                            )
-                            st.session_state.transcription = result["text"]
-                            st.success("Transcription complete")
-
-                            with st.expander("View transcription preview"):
-                                preview = st.session_state.transcription
-                                st.write(
-                                    preview[:500] + "..."
-                                    if len(preview) > 500
-                                    else preview
-                                )
-                        else:
-                            st.error("Recording file not found. Please record again.")
-                    except Exception as exc:
-                        st.error(f"Transcription failed: {exc}")
-            else:
-                st.error("Please load a model first from the sidebar.")
+        if st.session_state.transcription:
+            with st.expander("View transcription preview"):
+                preview = st.session_state.transcription
+                st.write(
+                    preview[:500] + "..."
+                    if len(preview) > 500
+                    else preview
+                )
 
 
 with tab2:
-    st.subheader("Upload Audio File")
+    st.subheader("Upload Audio Or Document")
 
     uploaded_file = st.file_uploader(
-        "Choose an audio file",
-        type=["mp3", "wav", "m4a", "ogg"],
+        "Choose an audio or document file",
+        type=["mp3", "wav", "m4a", "ogg", "txt", "pdf"],
     )
 
     if uploaded_file:
-        st.audio(uploaded_file)
+        uploaded_extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
+        is_audio_file = uploaded_extension in {"mp3", "wav", "m4a", "ogg"}
 
-        if st.button("Transcribe Uploaded", type="primary"):
-            if st.session_state.transcriber:
-                with st.spinner("Transcribing uploaded file..."):
-                    try:
-                        result = st.session_state.transcriber.transcribe_uploaded(
-                            uploaded_file
-                        )
-                        st.session_state.transcription = result["text"]
-                        st.success("Transcription complete")
-                    except Exception as exc:
-                        st.error(f"Transcription failed: {exc}")
+        if is_audio_file:
+            st.audio(uploaded_file)
+
+        button_label = "Transcribe Uploaded Audio" if is_audio_file else "Extract Document Text"
+
+        if st.button(button_label, type="primary"):
+            if is_audio_file:
+                if st.session_state.transcriber:
+                    with st.spinner("Transcribing uploaded audio..."):
+                        try:
+                            result = st.session_state.transcriber.transcribe_uploaded(
+                                uploaded_file
+                            )
+                            st.session_state.transcription = (
+                                normalize_transcription_for_selected_language(
+                                    result["text"],
+                                    tts_lang,
+                                )
+                            )
+                            st.success("Transcription complete")
+                        except Exception as exc:
+                            st.error(f"Transcription failed: {exc}")
+                else:
+                    st.error("Please load a model first from the sidebar.")
             else:
-                st.error("Please load a model first from the sidebar.")
+                with st.spinner("Reading document..."):
+                    try:
+                        document_reader = DocumentReader()
+                        extracted_text = document_reader.read_uploaded_file(uploaded_file)
+                        if not extracted_text:
+                            st.error("No readable text was found in the document.")
+                        else:
+                            st.session_state.transcription = extracted_text
+                            st.success("Document text extracted")
+                    except Exception as exc:
+                        st.error(f"Document processing failed: {exc}")
 
 
 with tab3:
@@ -191,13 +401,30 @@ with tab3:
                     else "Analyzing..."
                 )
                 with st.spinner(spinner_text):
+                    cleanup_generated_audio()
                     st.session_state.summary = st.session_state.summarizer.generate_summary(
-                        st.session_state.transcription, style
+                        st.session_state.transcription,
+                        style,
+                        target_language=tts_lang,
                     )
                     st.success("Summary generated")
 
         if st.session_state.summary:
             st.divider()
+
+            summary_provider = st.session_state.summary.get("ai_provider", "local")
+            summary_model = st.session_state.summary.get("ai_model", "local")
+            summary_ai_used = st.session_state.summary.get("ai_used", False)
+            fallback_reason = st.session_state.summary.get("fallback_reason", "")
+
+            if summary_ai_used:
+                st.caption(
+                    f"Summary generated with {summary_provider.capitalize()} ({summary_model})"
+                )
+            elif fallback_reason:
+                st.warning(
+                    f"AI summary unavailable, local summary used instead. Reason: {fallback_reason}"
+                )
 
             if st.session_state.summary.get("summary"):
                 st.markdown("### Summary")
@@ -251,22 +478,49 @@ with tab3:
 
             audio_col1, audio_col2 = st.columns([1, 1])
             with audio_col1:
-                if st.button("Listen to Summary", use_container_width=True):
-                    tts = TTSEngine(tts_lang)
-                    text_to_speak = f"Summary: {st.session_state.summary.get('summary', '')}. "
-                    if st.session_state.summary.get("action_items"):
-                        text_to_speak += "Action items: " + ". ".join(
-                            st.session_state.summary.get("action_items", [])
-                        )
-
+                if st.button("Generate Human-Like Voice", use_container_width=True):
+                    cleanup_generated_audio()
+                    tts = TTSEngine(
+                        lang=tts_lang,
+                        tld=voice_accent,
+                        slow=voice_is_slow,
+                    )
+                    spoken_summary = build_spoken_summary(
+                        st.session_state.summary,
+                        voice_tone,
+                    )
                     with st.spinner("Generating audio..."):
-                        audio_file = tts.text_to_speech(text_to_speak[:500])
+                        audio_file = tts.text_to_speech(spoken_summary)
                         if audio_file:
-                            st.audio(audio_file)
-                            import time
+                            audio_bytes = tts.read_audio_bytes(audio_file)
+                            if audio_bytes:
+                                st.session_state.generated_audio_file = audio_file
+                                st.session_state.generated_audio_bytes = audio_bytes
+                                st.session_state.generated_audio_name = (
+                                    f"voice_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
+                                )
+                                st.session_state.spoken_summary_text = spoken_summary
+                                st.success("Voice summary ready")
+                            else:
+                                tts.cleanup(audio_file)
+                                st.error("Audio was created but could not be loaded.")
+                        else:
+                            st.error("Could not generate voice summary.")
+            with audio_col2:
+                if st.session_state.generated_audio_bytes:
+                    st.download_button(
+                        "Download Voice Summary",
+                        data=st.session_state.generated_audio_bytes,
+                        file_name=st.session_state.generated_audio_name,
+                        mime="audio/mpeg",
+                        use_container_width=True,
+                    )
 
-                            time.sleep(2)
-                            tts.cleanup(audio_file)
+            if st.session_state.generated_audio_bytes:
+                st.markdown("### Voice Summary")
+                st.audio(st.session_state.generated_audio_bytes, format="audio/mp3")
+                with st.expander("Voice script preview"):
+                    st.write(st.session_state.spoken_summary_text)
     else:
         st.info("No transcription yet. Record or upload audio first.")
 

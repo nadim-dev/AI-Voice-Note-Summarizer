@@ -9,6 +9,7 @@ print("=" * 50)
 
 # 1. Check FFmpeg
 print("1. Checking FFmpeg...")
+
 try:
     result = subprocess.run(['ffmpeg', '-version'], 
                           capture_output=True, 
